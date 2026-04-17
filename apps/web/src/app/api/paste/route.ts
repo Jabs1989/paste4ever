@@ -1,19 +1,24 @@
 import { NextResponse } from "next/server";
-import { savePaste } from "@/lib/store";
+
+const RUST_API_URL = process.env.RUST_API_URL || "http://localhost:8080";
 
 export async function POST(req: Request) {
-  const { content } = await req.json();
+  const body = await req.json();
 
-  if (!content || typeof content !== "string") {
-    return NextResponse.json({ error: "Content required" }, { status: 400 });
-  }
-  if (content.length > 100_000) {
+  try {
+    const res = await fetch(`${RUST_API_URL}/paste`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    const data = await res.json();
+    return NextResponse.json(data, { status: res.status });
+  } catch (err) {
+    console.error("Rust API unreachable:", err);
     return NextResponse.json(
-      { error: "Content too large (max 100KB)" },
-      { status: 413 }
+      { error: "Storage service unavailable" },
+      { status: 503 }
     );
   }
-
-  const id = savePaste(content);
-  return NextResponse.json({ id });
 }
