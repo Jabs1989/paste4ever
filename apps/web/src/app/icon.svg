@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- Paste4Ever mark: a yellow post-it, tilted -1.5°, with a red pushpin -->
+  <!-- Dark background so the note pops when Chrome draws the dark tab bar -->
+  <rect width="32" height="32" rx="6" fill="#1e1b16" />
+  <!-- The post-it, slightly rotated around its own center -->
+  <g transform="rotate(-6 16 17)">
+    <!-- paper with subtle shadow -->
+    <rect x="6" y="8" width="20" height="18" rx="1" fill="#fef3c7" />
+    <rect x="6" y="8" width="20" height="18" rx="1" fill="url(#shade)" />
+    <!-- three lines of writing, purely decorative -->
+    <rect x="9"  y="14" width="14" height="1.2" rx="0.6" fill="#7a5a12" opacity="0.55"/>
+    <rect x="9"  y="17.5" width="12" height="1.2" rx="0.6" fill="#7a5a12" opacity="0.45"/>
+    <rect x="9"  y="21" width="8"  height="1.2" rx="0.6" fill="#7a5a12" opacity="0.4"/>
+  </g>
+  <!-- Pushpin sits above the tilted note, straight and centered -->
+  <circle cx="16" cy="7.5" r="3" fill="#dc2626" />
+  <circle cx="15.2" cy="6.8" r="1" fill="#fca5a5" opacity="0.85" />
+  <defs>
+    <linearGradient id="shade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fef3c7" stop-opacity="0" />
+      <stop offset="1" stop-color="#d6a04a" stop-opacity="0.25" />
+    </linearGradient>
+  </defs>
+</svg>

@@ -289,7 +289,47 @@ export default function Home() {
       <header className="border-b border-border/40">
         <div className="mx-auto max-w-5xl px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <div className="size-7 rounded-md bg-gradient-to-br from-orange-400 to-pink-500" />
+            {/* Paste4Ever wordmark — tiny post-it + pushpin, matches the
+                corkboard wall below. Inline SVG so it's zero-request and
+                stays crisp at any size. */}
+            <svg
+              viewBox="0 0 32 32"
+              aria-hidden
+              className="size-7 shrink-0"
+            >
+              <g transform="rotate(-6 16 17)">
+                <rect x="6" y="8" width="20" height="18" rx="1" fill="#fef3c7" />
+                <rect
+                  x="9"
+                  y="14"
+                  width="14"
+                  height="1.2"
+                  rx="0.6"
+                  fill="#7a5a12"
+                  opacity="0.55"
+                />
+                <rect
+                  x="9"
+                  y="17.5"
+                  width="12"
+                  height="1.2"
+                  rx="0.6"
+                  fill="#7a5a12"
+                  opacity="0.45"
+                />
+                <rect
+                  x="9"
+                  y="21"
+                  width="8"
+                  height="1.2"
+                  rx="0.6"
+                  fill="#7a5a12"
+                  opacity="0.4"
+                />
+              </g>
+              <circle cx="16" cy="7.5" r="3" fill="#dc2626" />
+              <circle cx="15.2" cy="6.8" r="1" fill="#fca5a5" opacity="0.85" />
+            </svg>
             <span className="font-semibold tracking-tight">Paste4Ever</span>
           </div>
           <div className="flex items-center gap-4">
