@@ -3,6 +3,7 @@
 import { useState, useEffect, use } from "react";
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
+import { apiUrl } from "@/lib/api";
 
 type Params = Promise<{ id: string }>;
 
@@ -15,7 +16,7 @@ export default function PastePage({ params }: { params: Params }) {
   const [linkCopied, setLinkCopied] = useState(false);
 
   useEffect(() => {
-    fetch(`/api/paste/${id}`)
+    fetch(apiUrl(`/paste/${id}`))
       .then((res) => res.json())
       .then((data) => {
         if (data.content !== undefined) setContent(data.content);

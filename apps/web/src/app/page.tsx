@@ -6,6 +6,7 @@ import Link from "next/link";
 import Script from "next/script";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { apiUrl } from "@/lib/api";
 
 // Cloudflare Turnstile site key. When unset (local dev) we skip the widget
 // entirely and the Rust API also skips verification — dev works with no
@@ -105,7 +106,7 @@ export default function Home() {
 
   const loadHealth = useCallback(async () => {
     try {
-      const res = await fetch("/api/health", { cache: "no-store" });
+      const res = await fetch(apiUrl("/health"), { cache: "no-store" });
       if (!res.ok) return;
       const data = (await res.json()) as Health;
       setHealth(data);
@@ -116,7 +117,7 @@ export default function Home() {
 
   const loadRecent = useCallback(async () => {
     try {
-      const res = await fetch("/api/recent?limit=20", { cache: "no-store" });
+      const res = await fetch(apiUrl("/recent?limit=20"), { cache: "no-store" });
       if (!res.ok) return;
       const data = (await res.json()) as RecentPaste[];
       if (Array.isArray(data)) setRecent(data);
@@ -182,7 +183,7 @@ export default function Home() {
     }
     setLoading(true);
     try {
-      const res = await fetch("/api/paste", {
+      const res = await fetch(apiUrl("/paste"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
