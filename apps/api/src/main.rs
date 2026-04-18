@@ -6,14 +6,17 @@
 //! specific business logic (size limits, future rate limiting, etc).
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
+use parking_lot::Mutex;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -22,6 +25,47 @@ struct AppState {
     /// Base URL of the local antd daemon, e.g. http://localhost:8082
     antd_url: String,
     http: reqwest::Client,
+    /// Local SQLite index of pastes made through this API. The index is just
+    /// a cache for the /recent wall — the actual paste bytes live on Autonomi
+    /// and remain retrievable by address even if this DB is wiped.
+    db: Arc<Mutex<Connection>>,
+}
+
+// ── SQLite schema ─────────────────────────────────────────────────────────
+/// Returns an 80-char preview with newlines collapsed, plus an ellipsis if
+/// the original was longer. The preview lives in our DB so the wall can
+/// render instantly without round-tripping back to Autonomi for every card.
+fn make_preview(content: &str) -> String {
+    const MAX: usize = 80;
+    let flat: String = content
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect();
+    let trimmed = flat.trim();
+    if trimmed.chars().count() <= MAX {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(MAX).collect();
+        format!("{}…", head)
+    }
+}
+
+fn init_db(path: &str) -> anyhow::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS pastes (
+            id          TEXT PRIMARY KEY,
+            created_at  INTEGER NOT NULL,
+            size_bytes  INTEGER NOT NULL,
+            preview     TEXT NOT NULL,
+            listed      INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_pastes_listed_created
+            ON pastes(listed, created_at DESC);
+        "#,
+    )?;
+    Ok(conn)
 }
 
 #[derive(Deserialize)]
@@ -111,7 +155,7 @@ async fn create_paste(
                 .copied()
                 .unwrap_or(60);
             tracing::warn!(
-                "⏳ retry {}/{} in {}s (autonomi idempotent — no double charge)",
+                "⏳ retry {}/{} in {}s (warning: antd may re-pay for chunks on retry)",
                 attempt,
                 UPLOAD_MAX_ATTEMPTS,
                 delay
@@ -170,6 +214,30 @@ async fn create_paste(
             attempt,
             UPLOAD_MAX_ATTEMPTS
         );
+
+        // Record the paste in our local index so it shows up on the public wall.
+        // Best-effort: a DB error here must NOT fail the user's paste, so we
+        // just log and move on — the bytes are already safely on Autonomi.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let preview = make_preview(&req.content);
+        let size = req.content.len() as i64;
+        let id_for_db = parsed.address.clone();
+        let db = state.db.clone();
+        if let Err(e) = (|| -> rusqlite::Result<()> {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT OR IGNORE INTO pastes (id, created_at, size_bytes, preview, listed)
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                rusqlite::params![id_for_db, now, size, preview],
+            )?;
+            Ok(())
+        })() {
+            tracing::warn!("failed to index paste {} in wall DB: {}", parsed.address, e);
+        }
+
         return (
             StatusCode::OK,
             Json(CreatePasteResponse { id: parsed.address }),
@@ -292,6 +360,64 @@ async fn get_paste(
         .into_response()
 }
 
+// ── Wall of pastes ────────────────────────────────────────────────────────
+#[derive(Serialize)]
+struct RecentPaste {
+    id: String,
+    created_at: i64,
+    size_bytes: i64,
+    preview: String,
+}
+
+#[derive(Deserialize)]
+struct RecentQuery {
+    limit: Option<u32>,
+}
+
+async fn recent_pastes(
+    State(state): State<AppState>,
+    Query(q): Query<RecentQuery>,
+) -> impl IntoResponse {
+    // Clamp to a sane range. Homepage shows ~20; max 100 for future API consumers.
+    let limit = q.limit.unwrap_or(20).clamp(1, 100) as i64;
+
+    let rows = {
+        let conn = state.db.lock();
+        let result = (|| -> Result<Vec<RecentPaste>, rusqlite::Error> {
+            let mut stmt = conn.prepare(
+                "SELECT id, created_at, size_bytes, preview
+                 FROM pastes
+                 WHERE listed = 1
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+            )?;
+            let iter = stmt.query_map([limit], |row| {
+                Ok(RecentPaste {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    size_bytes: row.get(2)?,
+                    preview: row.get(3)?,
+                })
+            })?;
+            iter.collect::<Result<Vec<_>, _>>()
+        })();
+        drop(conn);
+        result
+    };
+
+    match rows {
+        Ok(list) => (StatusCode::OK, Json(list)).into_response(),
+        Err(e) => {
+            tracing::error!("recent_pastes DB error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Could not load recent pastes" })),
+            )
+                .into_response()
+        }
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -308,13 +434,20 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("🌐 antd gateway: {}", antd_url);
 
     // Autonomi uploads (quote → pay on Arbitrum → store chunks across peers)
-    // can legitimately take 2-4 minutes on first-seen content. 300s gives us
-    // a comfortable margin without hiding real stalls forever.
+    // can legitimately take 2-4 minutes on first-seen content, but when the
+    // DHT has stale peers a successful upload can stretch to 10-15 minutes
+    // while antd retries internally. We set a generous 20-minute ceiling so
+    // we don't cut off antd mid-DataMap and trigger a *second* payment on our
+    // own retry path. Real stalls are caught by antd-side timeouts before us.
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .timeout(std::time::Duration::from_secs(1200))
         .build()?;
 
-    let state = AppState { antd_url, http };
+    let db_path = std::env::var("PASTES_DB").unwrap_or_else(|_| "pastes.db".to_string());
+    tracing::info!("📒 wall index DB: {}", db_path);
+    let db = Arc::new(Mutex::new(init_db(&db_path)?));
+
+    let state = AppState { antd_url, http, db };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -325,6 +458,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(health))
         .route("/paste", post(create_paste))
         .route("/paste/:id", get(get_paste))
+        .route("/recent", get(recent_pastes))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

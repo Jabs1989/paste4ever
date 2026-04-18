@@ -17,6 +17,12 @@ target/
 **/*.rs.bk
 Cargo.lock.bak
 
+# Local SQLite wall index (rebuilt from scratch per environment)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # Production
 *.production
 
