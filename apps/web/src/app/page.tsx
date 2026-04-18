@@ -13,10 +13,11 @@ import { apiUrl } from "@/lib/api";
 // Cloudflare account.
 const TURNSTILE_SITE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || "";
 
-// Must match the server-side minimum in apps/api/src/main.rs. Autonomi bills
-// per chunk, not per character, so a 1-char paste costs the same as a 2KB
-// one — this floor is about quality, not cost.
-const MIN_CONTENT_LEN = 20;
+// Hard cap on paste length. Must match the server-side MAX_CHARS in
+// apps/api/src/main.rs. Tweet-length intentionally — Paste4Ever is
+// positioned as "permanent tweets", one thought per paste, and short
+// posts keep the wall scannable.
+const MAX_CONTENT_LEN = 280;
 
 // Minimal typing of the global Cloudflare Turnstile API we touch.
 declare global {
@@ -179,8 +180,10 @@ export default function Home() {
   }, [loading]);
 
   async function handleSave() {
-    if (Array.from(content.trim()).length < MIN_CONTENT_LEN) {
-      alert(`Pastes must be at least ${MIN_CONTENT_LEN} characters.`);
+    const count = Array.from(content.trim()).length;
+    if (count === 0) return;
+    if (count > MAX_CONTENT_LEN) {
+      alert(`Pastes are capped at ${MAX_CONTENT_LEN} characters.`);
       return;
     }
     // If Turnstile is enabled on the frontend, we must have a token. The
@@ -311,31 +314,31 @@ export default function Home() {
           </div>
         )}
         <Textarea
-          placeholder="Paste your text, code, or notes here..."
+          placeholder="Say something worth keeping forever..."
           value={content}
           onChange={(e) => setContent(e.target.value)}
-          className="min-h-[400px] font-mono text-sm resize-none"
+          className="min-h-[140px] font-mono text-base resize-none"
           disabled={loading}
+          maxLength={MAX_CONTENT_LEN * 2 /* soft limit — counter handles UX */}
         />
         <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-          {/* Live char counter. While under the minimum we show a helpful
-              "X / 20 minimum" so users know why the button is disabled.
-              Once they clear the floor it drops to a plain count.
-              Using Array.from(str) to count grapheme code points so emoji
-              aren't double-counted against UTF-16 surrogate pairs. */}
+          {/* Live char counter with X / 280 max. Flips amber as the user
+              approaches the cap (>=80%) and red once over, mirroring the
+              server's hard rejection. Array.from(str) counts grapheme
+              code points so emoji aren't double-counted. */}
           {(() => {
             const count = Array.from(content).length;
-            const tooShort = count > 0 && count < MIN_CONTENT_LEN;
+            const over = count > MAX_CONTENT_LEN;
+            const nearing = !over && count >= MAX_CONTENT_LEN * 0.8;
+            const colour = over
+              ? "text-red-400"
+              : nearing
+                ? "text-amber-400"
+                : "text-muted-foreground";
             return (
-              <span
-                className={`text-xs ${
-                  tooShort ? "text-amber-400" : "text-muted-foreground"
-                }`}
-              >
-                {count.toLocaleString()}
-                {tooShort
-                  ? ` / ${MIN_CONTENT_LEN} minimum`
-                  : " characters"}
+              <span className={`text-xs tabular-nums ${colour}`}>
+                {count.toLocaleString()} / {MAX_CONTENT_LEN}
+                {over && " — too long"}
               </span>
             );
           })()}
@@ -346,7 +349,8 @@ export default function Home() {
             <Button
               onClick={handleSave}
               disabled={
-                Array.from(content.trim()).length < MIN_CONTENT_LEN ||
+                !content.trim() ||
+                Array.from(content).length > MAX_CONTENT_LEN ||
                 loading ||
                 (!!TURNSTILE_SITE_KEY && !turnstileToken)
               }

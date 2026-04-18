@@ -203,7 +203,11 @@ fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
 /// the original was longer. The preview lives in our DB so the wall can
 /// render instantly without round-tripping back to Autonomi for every card.
 fn make_preview(content: &str) -> String {
-    const MAX: usize = 80;
+    // Pastes are already capped at 280 chars server-side, so the preview
+    // can be the full content (with newlines collapsed). No ellipsis is
+    // needed at the paste-length limit, but we keep a defensive truncate
+    // at 300 just in case older pastes somehow slipped past the cap.
+    const MAX: usize = 300;
     let flat: String = content
         .chars()
         .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
@@ -343,24 +347,18 @@ async fn create_paste(
         )
             .into_response();
     }
-    // Min-length gate. Autonomi bills per chunk, not per char, so a 1-char
-    // paste costs the same as a 2KB one (~$0.10 in ANT). 20 chars is a
-    // soft floor that filters "a" / "test" / "asdf" spam without hurting
-    // real users — a single tweet is ~200 chars. Counted in chars, not
-    // bytes, so emoji and CJK users don't get penalized.
-    if req.content.chars().count() < 20 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Paste is too short. Please share something worth keeping forever (minimum 20 characters)."
-            })),
-        )
-            .into_response();
-    }
-    if req.content.len() > 100_000 {
+    // Hard cap at tweet length. Paste4Ever is positioned as "permanent
+    // tweets, forever" — a one-thought-per-paste wall. Short posts keep
+    // the wall readable and remove abuse vectors (no 99KB spam walls, no
+    // dumped credential files, no pasted malware). Counted in chars
+    // (code points) so CJK and emoji users aren't penalized vs ASCII.
+    const MAX_CHARS: usize = 280;
+    if req.content.chars().count() > MAX_CHARS {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({ "error": "Content too large (max 100KB)" })),
+            Json(serde_json::json!({
+                "error": format!("Too long. Pastes are capped at {} characters.", MAX_CHARS)
+            })),
         )
             .into_response();
     }
