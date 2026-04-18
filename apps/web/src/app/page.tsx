@@ -20,6 +20,12 @@ type RecentPaste = {
   preview: string;
 };
 
+type Health = {
+  status: "healthy" | "degraded";
+  antd_reachable: boolean;
+  consecutive_failures: number;
+};
+
 function timeAgo(unixSeconds: number): string {
   const diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
   if (diff < 60) return `${diff}s ago`;
@@ -40,7 +46,19 @@ export default function Home() {
   const [elapsed, setElapsed] = useState(0);
   const [recent, setRecent] = useState<RecentPaste[]>([]);
   const [copiedAddr, setCopiedAddr] = useState(false);
+  const [health, setHealth] = useState<Health | null>(null);
   const router = useRouter();
+
+  const loadHealth = useCallback(async () => {
+    try {
+      const res = await fetch("/api/health", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as Health;
+      setHealth(data);
+    } catch {
+      // If even the proxy blows up, pretend we don't know — badge hides itself.
+    }
+  }, []);
 
   const loadRecent = useCallback(async () => {
     try {
@@ -59,6 +77,15 @@ export default function Home() {
     const t = setInterval(loadRecent, 30_000);
     return () => clearInterval(t);
   }, [loadRecent]);
+
+  useEffect(() => {
+    loadHealth();
+    // Poll network health frequently enough that the badge reflects reality
+    // within ~15s of a degradation — fast enough to warn before a user commits
+    // to a doomed paste.
+    const t = setInterval(loadHealth, 15_000);
+    return () => clearInterval(t);
+  }, [loadHealth]);
 
   // Tick an elapsed counter while uploading so the user knows we're not frozen.
   useEffect(() => {
@@ -119,14 +146,35 @@ export default function Home() {
             <div className="size-7 rounded-md bg-gradient-to-br from-orange-400 to-pink-500" />
             <span className="font-semibold tracking-tight">Paste4Ever</span>
           </div>
-          <a
-            href="https://github.com/Jabs1989/paste4ever"
-            target="_blank"
-            rel="noreferrer"
-            className="text-sm text-muted-foreground hover:text-foreground transition"
-          >
-            GitHub
-          </a>
+          <div className="flex items-center gap-4">
+            {health && (
+              <span
+                className="flex items-center gap-1.5 text-xs text-muted-foreground"
+                title={
+                  health.status === "healthy"
+                    ? "Autonomi network is healthy"
+                    : `Network is degraded — ${health.consecutive_failures} recent failure(s). Saves may not land.`
+                }
+              >
+                <span
+                  className={`inline-block size-2 rounded-full ${
+                    health.status === "healthy"
+                      ? "bg-emerald-400"
+                      : "bg-amber-400 animate-pulse"
+                  }`}
+                />
+                {health.status === "healthy" ? "Network healthy" : "Reconnecting"}
+              </span>
+            )}
+            <a
+              href="https://github.com/Jabs1989/paste4ever"
+              target="_blank"
+              rel="noreferrer"
+              className="text-sm text-muted-foreground hover:text-foreground transition"
+            >
+              GitHub
+            </a>
+          </div>
         </div>
       </header>
 
@@ -152,6 +200,14 @@ export default function Home() {
       </section>
 
       <section className="mx-auto max-w-3xl w-full px-6 pb-16">
+        {health?.status === "degraded" && !loading && (
+          <div className="mb-4 rounded-lg border border-amber-400/40 bg-amber-400/10 p-3 text-sm text-amber-200">
+            <span className="font-medium">Network is reconnecting.</span>{" "}
+            Recent pastes have failed to land — we&apos;re restarting the upstream
+            node. Try again in a minute or two. You won&apos;t be charged for
+            failed uploads that never reach the network.
+          </div>
+        )}
         <Textarea
           placeholder="Paste your text, code, or notes here..."
           value={content}
