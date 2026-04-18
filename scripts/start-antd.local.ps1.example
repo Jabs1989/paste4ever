@@ -1,0 +1,10 @@
+# Copy this file to `start-antd.local.ps1` and fill in your own values.
+# The .local copy is gitignored — never commit your wallet key.
+
+# REQUIRED: the private key of the hot wallet that pays for pastes.
+# Must hold ANT (storage) + ETH (Arbitrum gas).
+$env:AUTONOMI_WALLET_KEY = "0xYOUR_PRIVATE_KEY_HERE"
+
+# OPTIONAL: override default paths.
+# $env:ANTD_BIN    = "D:\autonomi\antd.exe"
+# $env:RUST_LOG    = "info,saorsa_core=warn"

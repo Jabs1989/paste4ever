@@ -16,6 +16,7 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -29,6 +30,11 @@ struct AppState {
     /// a cache for the /recent wall — the actual paste bytes live on Autonomi
     /// and remain retrievable by address even if this DB is wiped.
     db: Arc<Mutex<Connection>>,
+    /// Rolling count of consecutive *fully-failed* paste uploads (all retries
+    /// exhausted). Reset to 0 on any successful upload. Used by /health so
+    /// the external watchdog can restart antd when its DHT rots, and by the
+    /// frontend to warn users before they waste a click.
+    consecutive_failures: Arc<AtomicU32>,
 }
 
 // ── SQLite schema ─────────────────────────────────────────────────────────
@@ -105,8 +111,45 @@ struct AntdGetResponse {
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────
-async fn health() -> &'static str {
-    "Paste4Ever API — OK"
+
+/// Health signal for the homepage badge and the external antd watchdog.
+///
+/// Two things are checked, cheaply:
+/// 1. TCP/HTTP reachability of antd — any HTTP response (even a 404 on /) is
+///    enough to prove the daemon process is alive and listening.
+/// 2. The rolling count of *fully-failed* paste uploads since the last success.
+///    This is the real signal that the DHT has rotted: antd is still up and
+///    accepting HTTP, but K-buckets are full of stale peers and no upload can
+///    land. When `consecutive_failures` reaches 2+, the watchdog should
+///    restart antd.
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str, // "healthy" | "degraded"
+    antd_reachable: bool,
+    consecutive_failures: u32,
+}
+
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    // Probe antd with a short timeout. We don't care about the status code,
+    // only that the TCP handshake + HTTP response completed quickly.
+    let probe = state
+        .http
+        .get(&state.antd_url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await;
+    let antd_reachable = probe.is_ok();
+    let consecutive_failures = state.consecutive_failures.load(Ordering::Relaxed);
+    let status = if antd_reachable && consecutive_failures < 2 {
+        "healthy"
+    } else {
+        "degraded"
+    };
+    Json(HealthResponse {
+        status,
+        antd_reachable,
+        consecutive_failures,
+    })
 }
 
 /// Max number of attempts for a paste upload.
@@ -214,6 +257,8 @@ async fn create_paste(
             attempt,
             UPLOAD_MAX_ATTEMPTS
         );
+        // Reset the health counter — any success means the DHT is usable again.
+        state.consecutive_failures.store(0, Ordering::Relaxed);
 
         // Record the paste in our local index so it shows up on the public wall.
         // Best-effort: a DB error here must NOT fail the user's paste, so we
@@ -245,11 +290,14 @@ async fn create_paste(
             .into_response();
     }
 
-    // All attempts exhausted.
+    // All attempts exhausted — flip the health counter so the watchdog and
+    // the frontend badge both see the degraded state.
+    let new_count = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
     tracing::error!(
-        "❌ upload failed after {} attempts — last error: {:?}",
+        "❌ upload failed after {} attempts — last error: {:?} (consecutive_failures={})",
         UPLOAD_MAX_ATTEMPTS,
-        last_error_detail
+        last_error_detail,
+        new_count
     );
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -447,7 +495,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("📒 wall index DB: {}", db_path);
     let db = Arc::new(Mutex::new(init_db(&db_path)?));
 
-    let state = AppState { antd_url, http, db };
+    let state = AppState {
+        antd_url,
+        http,
+        db,
+        consecutive_failures: Arc::new(AtomicU32::new(0)),
+    };
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -456,6 +509,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", get(health))
+        .route("/health", get(health))
         .route("/paste", post(create_paste))
         .route("/paste/:id", get(get_paste))
         .route("/recent", get(recent_pastes))
