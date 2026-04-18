@@ -18,9 +18,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use axum::http::{HeaderName, Method};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
@@ -47,7 +47,51 @@ struct AppState {
     /// Protects the hot wallet: each paste costs ~$0.50 in ANT, so an
     /// unthrottled public endpoint is an open drain.
     rate_limiter: Arc<Mutex<RateLimiter>>,
+    /// In-memory store of in-flight + recently-completed paste jobs. The
+    /// POST /paste endpoint returns immediately with a job_id; the real
+    /// antd work runs in a spawned task and updates the job status here.
+    /// The browser polls GET /paste/status/<job_id> to find out when it
+    /// lands. Keyed by job_id; jobs age out after 10 minutes.
+    jobs: Arc<Mutex<HashMap<String, PasteJob>>>,
+    /// Atomic counter used as part of job_id generation. Combined with
+    /// a nanosecond timestamp this gives us unique ids without pulling
+    /// in a uuid dependency for a single call-site.
+    job_counter: Arc<AtomicU64>,
 }
+
+// ── Async paste jobs ──────────────────────────────────────────────────────
+
+/// Current state of a paste upload job. Serialized directly to the wire,
+/// hence the `#[serde(tag)]` / `rename_all` — the browser reads it as
+/// `{"status":"success","address":"..."}` etc.
+#[derive(Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum PasteJobStatus {
+    /// Upload is still running on the server. Browser should keep polling.
+    Pending,
+    /// Upload landed; `address` is the Autonomi data address (hex).
+    Success { address: String },
+    /// Upload failed after all retries. `error` is a short user-facing
+    /// message; `detail` carries the raw server error for debugging.
+    Failed {
+        error: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+struct PasteJob {
+    status: PasteJobStatus,
+    /// Wall-clock create time. Used to age out completed/abandoned jobs
+    /// so the in-memory map doesn't grow unboundedly.
+    created_at: Instant,
+}
+
+/// Max age a job is kept in memory. After this, GET /paste/status returns
+/// 404. The browser polls at most 10 min so this matches the client's
+/// own deadline.
+const JOB_TTL: Duration = Duration::from_secs(600);
 
 // ── Rate limiting ─────────────────────────────────────────────────────────
 
@@ -248,11 +292,11 @@ struct CreatePasteRequest {
     turnstile_token: Option<String>,
 }
 
-#[derive(Serialize)]
-struct CreatePasteResponse {
-    /// Autonomi data address (hex). Doubles as the paste ID — visible in the URL.
-    id: String,
-}
+// NOTE: the synchronous CreatePasteResponse type (returning the final
+// address) was removed when POST /paste switched to 202 + job polling.
+// The inline serde_json::json!() block in create_paste returns
+// `{ job_id, status: "pending" }`; on success the client then reads
+// `{ status: "success", address }` from GET /paste/status/:job_id.
 
 #[derive(Serialize)]
 struct GetPasteResponse {
@@ -423,10 +467,57 @@ async fn create_paste(
         }
     }
 
-    let body = AntdPutRequest {
-        data: B64.encode(req.content.as_bytes()),
+    // All the fast, synchronous checks passed. Time to create a job
+    // record and hand the slow antd work off to a background task so
+    // the browser gets a response in milliseconds — avoiding the
+    // Cloudflare edge's ~100s read-timeout on idle connections.
+    let job_id = {
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = state.job_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{:x}{:x}", now_nanos, n)
     };
+    {
+        let mut jobs = state.jobs.lock();
+        // GC expired jobs while we hold the lock. Keeps the map bounded
+        // without a separate tokio background task.
+        let cutoff = Instant::now() - JOB_TTL;
+        jobs.retain(|_, j| j.created_at > cutoff);
+        jobs.insert(
+            job_id.clone(),
+            PasteJob {
+                status: PasteJobStatus::Pending,
+                created_at: Instant::now(),
+            },
+        );
+    }
 
+    let task_state = state.clone();
+    let task_content = req.content;
+    let task_job_id = job_id.clone();
+    tokio::spawn(async move {
+        run_paste_upload(task_state, task_content, task_job_id).await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "job_id": job_id,
+            "status": "pending",
+        })),
+    )
+        .into_response()
+}
+
+/// Run the actual upload + SQLite-index work for a paste job. Called from
+/// a spawned tokio task so the HTTP handler can return 202 in milliseconds.
+/// Updates `state.jobs[job_id]` with the final status when done.
+async fn run_paste_upload(state: AppState, content: String, job_id: String) {
+    let body = AntdPutRequest {
+        data: B64.encode(content.as_bytes()),
+    };
     let url = format!("{}/v1/data/public", state.antd_url);
     let mut last_error_detail: Option<String> = None;
 
@@ -442,20 +533,20 @@ async fn create_paste(
                 UPLOAD_MAX_ATTEMPTS,
                 delay
             );
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            tokio::time::sleep(Duration::from_secs(delay)).await;
         }
         tracing::info!(
-            "→ POST {} ({} bytes raw) — attempt {}/{}",
+            "→ POST {} ({} bytes raw) — attempt {}/{} [job {}]",
             url,
-            req.content.len(),
+            content.len(),
             attempt,
-            UPLOAD_MAX_ATTEMPTS
+            UPLOAD_MAX_ATTEMPTS,
+            job_id
         );
 
         let res = match state.http.post(&url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => {
-                // Connection/timeout error — transient, retry.
                 tracing::warn!("antd unreachable on attempt {}: {}", attempt, e);
                 last_error_detail = Some(format!("transport: {}", e));
                 continue;
@@ -467,29 +558,24 @@ async fn create_paste(
             let detail = res.text().await.unwrap_or_default();
             tracing::warn!("antd {} on attempt {}: {}", status, attempt, detail);
             last_error_detail = Some(format!("{}: {}", status, detail));
-            // 5xx = server/network problem → retry. 4xx = client problem → give up.
             if status.is_server_error() {
-                // "partial upload: N stored, M failed" is a specific signal that
-                // some K-bucket in the DHT has stale peers and can't hold a
-                // chunk. That's exactly the condition the watchdog needs to
-                // see to decide on an antd restart — bump the counter *now*
-                // instead of waiting for all retries to exhaust. A subsequent
-                // successful attempt within the same request will reset it
-                // back to 0, so false positives self-heal quickly.
-                if detail.contains("partial upload") || detail.contains("chunk storage failed") {
+                if detail.contains("partial upload") || detail.contains("chunk storage failed")
+                {
                     let n = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
                     tracing::warn!("DHT-rot signal detected (consecutive_failures={})", n);
                 }
                 continue;
             }
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": "Upload rejected by storage daemon",
-                    "detail": detail
-                })),
-            )
-                .into_response();
+            // 4xx — permanent client error. Mark the job failed and stop.
+            finish_job(
+                &state,
+                &job_id,
+                PasteJobStatus::Failed {
+                    error: "Upload rejected by storage daemon.".to_string(),
+                    detail: Some(detail),
+                },
+            );
+            return;
         }
 
         let parsed: AntdPutResponse = match res.json().await {
@@ -502,23 +588,22 @@ async fn create_paste(
         };
 
         tracing::info!(
-            "✅ stored at {} (attempt {}/{})",
+            "✅ stored at {} (attempt {}/{}) [job {}]",
             parsed.address,
             attempt,
-            UPLOAD_MAX_ATTEMPTS
+            UPLOAD_MAX_ATTEMPTS,
+            job_id
         );
-        // Reset the health counter — any success means the DHT is usable again.
         state.consecutive_failures.store(0, Ordering::Relaxed);
 
-        // Record the paste in our local index so it shows up on the public wall.
-        // Best-effort: a DB error here must NOT fail the user's paste, so we
-        // just log and move on — the bytes are already safely on Autonomi.
+        // Index the paste on our local wall. Best-effort — the bytes are
+        // already safely on Autonomi regardless of DB success.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let preview = make_preview(&req.content);
-        let size = req.content.len() as i64;
+        let preview = make_preview(&content);
+        let size = content.len() as i64;
         let id_for_db = parsed.address.clone();
         let db = state.db.clone();
         if let Err(e) = (|| -> rusqlite::Result<()> {
@@ -533,18 +618,17 @@ async fn create_paste(
             tracing::warn!("failed to index paste {} in wall DB: {}", parsed.address, e);
         }
 
-        return (
-            StatusCode::OK,
-            Json(CreatePasteResponse { id: parsed.address }),
-        )
-            .into_response();
+        finish_job(
+            &state,
+            &job_id,
+            PasteJobStatus::Success {
+                address: parsed.address,
+            },
+        );
+        return;
     }
 
-    // All attempts exhausted. The counter has already been bumped by each
-    // partial-upload attempt along the way (see the 5xx path above), so we
-    // don't increment again here — that would double-count on a fully-bad
-    // paste. If no partial-upload was seen (e.g. pure transport failure)
-    // we still bump once so the watchdog notices something is off.
+    // All attempts exhausted.
     let current = state.consecutive_failures.load(Ordering::Relaxed);
     let new_count = if current == 0 {
         state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
@@ -552,20 +636,47 @@ async fn create_paste(
         current
     };
     tracing::error!(
-        "❌ upload failed after {} attempts — last error: {:?} (consecutive_failures={})",
+        "❌ upload failed after {} attempts — last error: {:?} (consecutive_failures={}) [job {}]",
         UPLOAD_MAX_ATTEMPTS,
         last_error_detail,
-        new_count
+        new_count,
+        job_id
     );
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(serde_json::json!({
-            "error": "Autonomi network is currently congested. Your paste could not be stored after multiple attempts — please try again in a few minutes.",
-            "detail": last_error_detail,
-            "attempts": UPLOAD_MAX_ATTEMPTS,
-        })),
-    )
-        .into_response()
+    finish_job(
+        &state,
+        &job_id,
+        PasteJobStatus::Failed {
+            error: "Autonomi network is congested. Your paste could not be stored after multiple attempts — please try again in a few minutes.".to_string(),
+            detail: last_error_detail,
+        },
+    );
+}
+
+/// Update a job's terminal status in the shared map. No-op if the job
+/// has already been garbage-collected (browser gave up polling).
+fn finish_job(state: &AppState, job_id: &str, status: PasteJobStatus) {
+    let mut jobs = state.jobs.lock();
+    if let Some(j) = jobs.get_mut(job_id) {
+        j.status = status;
+    }
+}
+
+/// GET /paste/status/:job_id — the browser polls this while an upload is
+/// in flight. Returns the current `PasteJobStatus`, or 404 if the job id
+/// is unknown (never existed, or aged out after JOB_TTL).
+async fn get_paste_status(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> impl IntoResponse {
+    let jobs = state.jobs.lock();
+    match jobs.get(&job_id) {
+        Some(j) => (StatusCode::OK, Json(j.status.clone())).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Job not found or expired" })),
+        )
+            .into_response(),
+    }
 }
 
 /// Reads can also flake (peer holding the chunk briefly unreachable). Shorter
@@ -770,6 +881,8 @@ async fn main() -> anyhow::Result<()> {
         db,
         consecutive_failures: Arc::new(AtomicU32::new(0)),
         rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
+        jobs: Arc::new(Mutex::new(HashMap::new())),
+        job_counter: Arc::new(AtomicU64::new(0)),
     };
 
     // CORS. The frontend lives on paste4ever.com / www.paste4ever.com and
@@ -803,6 +916,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(health))
         .route("/health", get(health))
         .route("/paste", post(create_paste))
+        .route("/paste/status/:job_id", get(get_paste_status))
         .route("/paste/:id", get(get_paste))
         .route("/recent", get(recent_pastes))
         .layer(cors)

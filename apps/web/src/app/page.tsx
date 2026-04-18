@@ -190,14 +190,16 @@ export default function Home() {
       alert(`Pastes are capped at ${MAX_CONTENT_LEN} characters.`);
       return;
     }
-    // If Turnstile is enabled on the frontend, we must have a token. The
-    // button should already be disabled in that case, but belt-and-braces.
     if (TURNSTILE_SITE_KEY && !turnstileToken) {
       alert("Please complete the human verification challenge.");
       return;
     }
     setLoading(true);
     try {
+      // 1) Kick off the upload. This returns 202 + { job_id } in
+      //    milliseconds. The heavy antd work runs in the background on
+      //    the server — the browser never holds an open connection for
+      //    minutes, which sidesteps Cloudflare's 100s proxy timeout.
       const res = await fetch(apiUrl("/paste"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -208,10 +210,45 @@ export default function Home() {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || "Failed to save");
+        throw new Error(err.error || "Failed to start upload");
       }
-      const data = await res.json();
-      if (data.id) router.push(`/p/${data.id}`);
+      const { job_id } = (await res.json()) as { job_id: string };
+      if (!job_id) throw new Error("Server didn't return a job id");
+
+      // 2) Poll for status. Real paste uploads take 2-4 min; we give
+      //    up at 10 min so a stuck antd doesn't keep the UI pinned
+      //    forever. Poll interval of 7s is a friendly tradeoff: ~30
+      //    polls worst-case, finds completion within 7s of landing.
+      const startedAt = Date.now();
+      const DEADLINE_MS = 10 * 60 * 1000;
+      const POLL_MS = 7_000;
+      while (Date.now() - startedAt < DEADLINE_MS) {
+        await new Promise((r) => setTimeout(r, POLL_MS));
+        const statusRes = await fetch(
+          apiUrl(`/paste/status/${encodeURIComponent(job_id)}`),
+          { cache: "no-store" },
+        );
+        if (!statusRes.ok) {
+          // 404 = job GC'd (we took >10 min) or server restarted.
+          // Either way, stop — the user should retry from scratch.
+          throw new Error("Lost track of the upload. Please try again.");
+        }
+        const data = (await statusRes.json()) as
+          | { status: "pending" }
+          | { status: "success"; address: string }
+          | { status: "failed"; error: string; detail?: string };
+        if (data.status === "success") {
+          router.push(`/p/${data.address}`);
+          return;
+        }
+        if (data.status === "failed") {
+          throw new Error(data.error || "Upload failed");
+        }
+        // else: still pending — loop and poll again.
+      }
+      throw new Error(
+        "Upload is taking longer than expected. It may still land — check the wall in a minute.",
+      );
     } catch (err) {
       console.error(err);
       const msg =
@@ -219,7 +256,7 @@ export default function Home() {
           ? err.message
           : "Something went wrong. Please try again.";
       alert(msg);
-      // Tokens are single-use — reset the widget so the user can try again.
+      // Turnstile tokens are single-use; reset so the user can retry.
       if (turnstileWidgetId.current && window.turnstile) {
         window.turnstile.reset(turnstileWidgetId.current);
         setTurnstileToken(null);
