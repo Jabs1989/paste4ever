@@ -1,18 +1,66 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+
+// Hot wallet that pays for every paste. Tips go directly into the same wallet,
+// so a donation of ANT literally buys future pastes for other users. ETH also
+// accepted (Arbitrum One gas). It's fine to expose — the private key lives on
+// the server, not in the client.
+const DONATION_ADDRESS = "0xA580e7f83C2DC7D59108cdB4c8716EBffA9A9B3C";
+const ARBISCAN_URL = `https://arbiscan.io/address/${DONATION_ADDRESS}`;
+
+type RecentPaste = {
+  id: string;
+  created_at: number;
+  size_bytes: number;
+  preview: string;
+};
+
+function timeAgo(unixSeconds: number): string {
+  const diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSeconds);
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 export default function Home() {
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(0);
+  const [recent, setRecent] = useState<RecentPaste[]>([]);
+  const [copiedAddr, setCopiedAddr] = useState(false);
   const router = useRouter();
 
-  // Tick a progress counter while uploading so the user knows we're not frozen.
-  // Autonomi uploads take 2-4 min — silence feels broken, a timer feels honest.
+  const loadRecent = useCallback(async () => {
+    try {
+      const res = await fetch("/api/recent?limit=20", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as RecentPaste[];
+      if (Array.isArray(data)) setRecent(data);
+    } catch {
+      // Silent — wall is nice-to-have, not load-blocking.
+    }
+  }, []);
+
+  useEffect(() => {
+    loadRecent();
+    // Refresh the wall every 30s so new pastes trickle in without a page reload.
+    const t = setInterval(loadRecent, 30_000);
+    return () => clearInterval(t);
+  }, [loadRecent]);
+
+  // Tick an elapsed counter while uploading so the user knows we're not frozen.
   useEffect(() => {
     if (!loading) {
       setElapsed(0);
@@ -52,9 +100,16 @@ export default function Home() {
     }
   }
 
+  async function copyAddress() {
+    await navigator.clipboard.writeText(DONATION_ADDRESS);
+    setCopiedAddr(true);
+    setTimeout(() => setCopiedAddr(false), 2000);
+  }
+
   const mins = Math.floor(elapsed / 60);
   const secs = elapsed % 60;
   const timeStr = `${mins}:${String(secs).padStart(2, "0")}`;
+  const shortAddr = `${DONATION_ADDRESS.slice(0, 6)}…${DONATION_ADDRESS.slice(-4)}`;
 
   return (
     <main className="min-h-screen flex flex-col bg-background text-foreground">
@@ -96,7 +151,7 @@ export default function Home() {
         </p>
       </section>
 
-      <section className="mx-auto max-w-3xl w-full px-6 pb-24 flex-1">
+      <section className="mx-auto max-w-3xl w-full px-6 pb-16">
         <Textarea
           placeholder="Paste your text, code, or notes here..."
           value={content}
@@ -128,6 +183,83 @@ export default function Home() {
               Arbitrum, and distributed across the network. Please don&apos;t
               close this tab.
             </p>
+          </div>
+        )}
+      </section>
+
+      {/* ── Donation strip ────────────────────────────────────────────── */}
+      <section className="mx-auto max-w-3xl w-full px-6 pb-12">
+        <div className="rounded-xl border border-border/40 bg-card/30 p-5 text-sm">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="font-medium text-foreground mb-1">
+                Paste4Ever is free for everyone.
+              </p>
+              <p className="text-muted-foreground">
+                Every paste costs a few cents of ANT on Arbitrum. Want to help
+                keep it online? Send ANT or ETH to our storage wallet — it
+                literally pays for the next stranger&apos;s paste.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <code className="text-xs font-mono px-2 py-1 rounded bg-muted/50 border border-border/40">
+                {shortAddr}
+              </code>
+              <Button variant="outline" size="sm" onClick={copyAddress}>
+                {copiedAddr ? "Copied!" : "Copy"}
+              </Button>
+              <a
+                href={ARBISCAN_URL}
+                target="_blank"
+                rel="noreferrer"
+              >
+                <Button variant="outline" size="sm">
+                  Arbiscan
+                </Button>
+              </a>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* ── Wall of pastes ────────────────────────────────────────────── */}
+      <section className="mx-auto max-w-5xl w-full px-6 pb-24">
+        <div className="flex items-baseline justify-between mb-6">
+          <h2 className="text-2xl font-semibold tracking-tight">
+            Recent pastes
+          </h2>
+          <span className="text-xs text-muted-foreground">
+            {recent.length > 0
+              ? `${recent.length} most recent`
+              : "Be the first to paste"}
+          </span>
+        </div>
+
+        {recent.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-border/50 py-16 text-center text-sm text-muted-foreground">
+            No pastes yet. Yours could be the first one here forever.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {recent.map((p) => (
+              <Link
+                key={p.id}
+                href={`/p/${p.id}`}
+                className="group rounded-lg border border-border/40 bg-card/30 p-4 hover:bg-card/60 hover:border-border transition"
+              >
+                <p className="font-mono text-sm text-foreground/90 line-clamp-4 min-h-[4.5rem] break-words">
+                  {p.preview || "(empty)"}
+                </p>
+                <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                  <span className="font-mono truncate" title={p.id}>
+                    {p.id.slice(0, 10)}…
+                  </span>
+                  <span className="shrink-0 ml-2">
+                    {timeAgo(p.created_at)} · {formatBytes(p.size_bytes)}
+                  </span>
+                </div>
+              </Link>
+            ))}
           </div>
         )}
       </section>
