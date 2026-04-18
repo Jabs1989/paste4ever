@@ -14,9 +14,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
-
-# Autonomi (we'll add this in Wave 3b, commented for now)
-# autonomi = "0.10"
+dotenvy = "0.15"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3
