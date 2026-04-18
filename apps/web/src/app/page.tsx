@@ -74,27 +74,31 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// Stable per-paste color tint for the wall. Seeded by the paste id (hex),
-// so the same paste always gets the same colour — no flicker on reshuffle.
-// We pick from a small curated palette instead of a raw HSL shuffle so the
-// wall feels cohesive rather than noisy.
-const WALL_TINTS = [
-  // bg alpha is intentionally low; border carries the colour.
-  { bg: "rgba(248, 113, 113, 0.05)", border: "rgba(248, 113, 113, 0.28)" }, // red-400
-  { bg: "rgba(251, 146,  60, 0.05)", border: "rgba(251, 146,  60, 0.28)" }, // orange-400
-  { bg: "rgba(250, 204,  21, 0.05)", border: "rgba(250, 204,  21, 0.28)" }, // yellow-400
-  { bg: "rgba( 74, 222, 128, 0.05)", border: "rgba( 74, 222, 128, 0.28)" }, // green-400
-  { bg: "rgba( 45, 212, 191, 0.05)", border: "rgba( 45, 212, 191, 0.28)" }, // teal-400
-  { bg: "rgba( 96, 165, 250, 0.05)", border: "rgba( 96, 165, 250, 0.28)" }, // blue-400
-  { bg: "rgba(167, 139, 250, 0.05)", border: "rgba(167, 139, 250, 0.28)" }, // violet-400
-  { bg: "rgba(244, 114, 182, 0.05)", border: "rgba(244, 114, 182, 0.28)" }, // pink-400
+// Corkboard post-it palette. Bright pastels so notes pop off the cork.
+// Each paste's colour + rotation is seeded by its id (hex), so the same
+// paste always looks the same — no flicker on re-shuffle / refresh.
+const POSTIT_COLORS = [
+  { bg: "#fef3c7", text: "#3a2a04", pin: "#dc2626" }, // classic yellow
+  { bg: "#fce7f3", text: "#500724", pin: "#e11d48" }, // bubblegum pink
+  { bg: "#d1fae5", text: "#022c22", pin: "#059669" }, // mint
+  { bg: "#dbeafe", text: "#0c1e3e", pin: "#1d4ed8" }, // sky blue
+  { bg: "#ffedd5", text: "#431407", pin: "#ea580c" }, // peach
+  { bg: "#e9d5ff", text: "#2a0839", pin: "#7c3aed" }, // lavender
+  { bg: "#ccfbf1", text: "#042f2e", pin: "#0d9488" }, // seafoam
+  { bg: "#fee2e2", text: "#450a0a", pin: "#dc2626" }, // coral
 ];
 
-function tintFor(id: string): { bg: string; border: string } {
-  // First 4 hex chars is enough entropy for 8 buckets and it's stable across
-  // sessions. parseInt with base 16 handles the 0-9a-f alphabet.
+function postitFor(id: string): (typeof POSTIT_COLORS)[number] {
   const n = parseInt(id.slice(0, 4), 16) || 0;
-  return WALL_TINTS[n % WALL_TINTS.length];
+  return POSTIT_COLORS[n % POSTIT_COLORS.length];
+}
+
+// Slight random rotation for the "pinned by a hurried hand" look.
+// Range: -3° to +3°. Seeded by a different slice of the id than the
+// colour so rotation and colour don't correlate.
+function rotationFor(id: string): number {
+  const n = parseInt(id.slice(4, 8), 16) || 0;
+  return (n % 601) / 100 - 3;
 }
 
 export default function Home() {
@@ -411,11 +415,11 @@ export default function Home() {
         </div>
       </section>
 
-      {/* ── Wall of pastes ────────────────────────────────────────────── */}
+      {/* ── Wall of pastes (the corkboard) ─────────────────────────────── */}
       <section className="mx-auto max-w-6xl w-full px-6 pb-24">
         <div className="flex items-baseline justify-between mb-6">
           <h2 className="text-2xl font-semibold tracking-tight">
-            Recent pastes
+            The wall
           </h2>
           <span className="text-xs text-muted-foreground">
             {recent.length > 0
@@ -429,44 +433,92 @@ export default function Home() {
             No pastes yet. Yours could be the first one here forever.
           </div>
         ) : (
-          // CSS columns give us a true masonry layout without JS / any lib.
-          // Items flow top-to-bottom in the left column, then fill the next —
-          // `break-inside-avoid` keeps each card whole. Column count scales
-          // up with the viewport; gap stays consistent.
-          <div className="columns-1 sm:columns-2 lg:columns-3 xl:columns-4 gap-4 [column-fill:_balance]">
-            {recent.map((p) => {
-              const tint = tintFor(p.id);
-              return (
-                <Link
-                  key={p.id}
-                  href={`/p/${p.id}`}
-                  className="group mb-4 block rounded-lg border p-4 transition break-inside-avoid hover:brightness-125"
-                  style={{
-                    backgroundColor: tint.bg,
-                    borderColor: tint.border,
-                  }}
-                >
-                  {/* Preview grows up to 8 lines based on how long the actual
-                      paste is — that's what gives the wall its uneven,
-                      alive-looking rhythm. Short pastes stay small, long
-                      pastes tower. */}
-                  <p className="font-mono text-sm text-foreground/90 line-clamp-[8] whitespace-pre-wrap break-words">
-                    {p.preview || "(empty)"}
-                  </p>
-                  <div
-                    className="mt-3 pt-2 flex items-center justify-between text-xs text-muted-foreground border-t"
-                    style={{ borderColor: tint.border }}
+          // The corkboard. Base colour is a warm cork brown; layered radial
+          // gradients give it a pebbled, slightly uneven surface. An inset
+          // shadow darkens the edges so the whole frame feels tactile.
+          <div
+            className="relative rounded-2xl p-6 sm:p-10 overflow-hidden"
+            style={{
+              backgroundColor: "#b88a5e",
+              backgroundImage: `
+                radial-gradient(circle at 18% 22%, rgba(90,55,20,0.35) 0, rgba(90,55,20,0) 2.2%),
+                radial-gradient(circle at 72% 18%, rgba(90,55,20,0.30) 0, rgba(90,55,20,0) 1.8%),
+                radial-gradient(circle at 85% 55%, rgba(90,55,20,0.28) 0, rgba(90,55,20,0) 2.0%),
+                radial-gradient(circle at 40% 70%, rgba(90,55,20,0.32) 0, rgba(90,55,20,0) 2.0%),
+                radial-gradient(circle at 12% 85%, rgba(90,55,20,0.26) 0, rgba(90,55,20,0) 1.8%),
+                radial-gradient(circle at 60% 92%, rgba(90,55,20,0.28) 0, rgba(90,55,20,0) 1.8%),
+                radial-gradient(circle at 92% 88%, rgba(90,55,20,0.26) 0, rgba(90,55,20,0) 1.6%),
+                radial-gradient(circle at 28% 48%, rgba(90,55,20,0.22) 0, rgba(90,55,20,0) 1.5%),
+                radial-gradient(circle at 50% 35%, rgba(90,55,20,0.20) 0, rgba(90,55,20,0) 1.3%),
+                linear-gradient(135deg, #c4966a 0%, #a87c50 100%)
+              `,
+              backgroundSize:
+                "140px 140px, 110px 110px, 90px 90px, 120px 120px, 160px 160px, 100px 100px, 80px 80px, 70px 70px, 50px 50px, 100% 100%",
+              boxShadow:
+                "inset 0 0 60px rgba(0,0,0,0.35), inset 0 0 20px rgba(139,90,43,0.4), 0 10px 40px rgba(0,0,0,0.3)",
+            }}
+          >
+            {/* Inner frame — a subtle wooden trim around the cork. */}
+            <div
+              className="pointer-events-none absolute inset-2 rounded-xl"
+              style={{
+                border: "2px solid rgba(60,35,10,0.3)",
+                boxShadow: "inset 0 0 0 1px rgba(255,220,170,0.08)",
+              }}
+            />
+
+            {/* CSS columns masonry — same approach as before so notes settle
+                in organic uneven heights. break-inside-avoid keeps each
+                post-it whole. */}
+            <div className="relative columns-1 sm:columns-2 lg:columns-3 xl:columns-4 gap-6 [column-fill:_balance]">
+              {recent.map((p) => {
+                const c = postitFor(p.id);
+                const rot = rotationFor(p.id);
+                return (
+                  <Link
+                    key={p.id}
+                    href={`/p/${p.id}`}
+                    className="group relative block mb-6 p-4 pt-6 rounded-sm break-inside-avoid transition-transform duration-200 will-change-transform hover:!rotate-0 hover:z-10 hover:scale-[1.04]"
+                    style={{
+                      backgroundColor: c.bg,
+                      color: c.text,
+                      transform: `rotate(${rot}deg)`,
+                      boxShadow:
+                        "0 6px 14px rgba(0,0,0,0.30), 0 2px 4px rgba(0,0,0,0.18)",
+                    }}
                   >
-                    <span className="font-mono truncate" title={p.id}>
-                      {p.id.slice(0, 10)}…
-                    </span>
-                    <span className="shrink-0 ml-2">
-                      {timeAgo(p.created_at)} · {formatBytes(p.size_bytes)}
-                    </span>
-                  </div>
-                </Link>
-              );
-            })}
+                    {/* Pushpin. ::before style via an absolute <span>:
+                        glossy red disc with inner highlight + outer shadow. */}
+                    <span
+                      aria-hidden
+                      className="absolute -top-2 left-1/2 -translate-x-1/2 size-4 rounded-full"
+                      style={{
+                        backgroundColor: c.pin,
+                        backgroundImage:
+                          "radial-gradient(circle at 30% 30%, rgba(255,255,255,0.7) 0%, rgba(255,255,255,0) 40%)",
+                        boxShadow:
+                          "0 2px 3px rgba(0,0,0,0.5), 0 1px 1px rgba(0,0,0,0.3), inset 0 -1px 2px rgba(0,0,0,0.3)",
+                      }}
+                    />
+
+                    <p className="font-mono text-sm leading-snug whitespace-pre-wrap break-words">
+                      {p.preview || "(empty)"}
+                    </p>
+                    <div
+                      className="mt-3 pt-2 flex items-center justify-between text-[10px] opacity-60 border-t"
+                      style={{ borderColor: "rgba(0,0,0,0.12)" }}
+                    >
+                      <span className="font-mono truncate" title={p.id}>
+                        {p.id.slice(0, 8)}…
+                      </span>
+                      <span className="shrink-0 ml-2">
+                        {timeAgo(p.created_at)} · {formatBytes(p.size_bytes)}
+                      </span>
+                    </div>
+                  </Link>
+                );
+              })}
+            </div>
           </div>
         )}
       </section>
