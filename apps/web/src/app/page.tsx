@@ -67,6 +67,29 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+// Stable per-paste color tint for the wall. Seeded by the paste id (hex),
+// so the same paste always gets the same colour — no flicker on reshuffle.
+// We pick from a small curated palette instead of a raw HSL shuffle so the
+// wall feels cohesive rather than noisy.
+const WALL_TINTS = [
+  // bg alpha is intentionally low; border carries the colour.
+  { bg: "rgba(248, 113, 113, 0.05)", border: "rgba(248, 113, 113, 0.28)" }, // red-400
+  { bg: "rgba(251, 146,  60, 0.05)", border: "rgba(251, 146,  60, 0.28)" }, // orange-400
+  { bg: "rgba(250, 204,  21, 0.05)", border: "rgba(250, 204,  21, 0.28)" }, // yellow-400
+  { bg: "rgba( 74, 222, 128, 0.05)", border: "rgba( 74, 222, 128, 0.28)" }, // green-400
+  { bg: "rgba( 45, 212, 191, 0.05)", border: "rgba( 45, 212, 191, 0.28)" }, // teal-400
+  { bg: "rgba( 96, 165, 250, 0.05)", border: "rgba( 96, 165, 250, 0.28)" }, // blue-400
+  { bg: "rgba(167, 139, 250, 0.05)", border: "rgba(167, 139, 250, 0.28)" }, // violet-400
+  { bg: "rgba(244, 114, 182, 0.05)", border: "rgba(244, 114, 182, 0.28)" }, // pink-400
+];
+
+function tintFor(id: string): { bg: string; border: string } {
+  // First 4 hex chars is enough entropy for 8 buckets and it's stable across
+  // sessions. parseInt with base 16 handles the 0-9a-f alphabet.
+  const n = parseInt(id.slice(0, 4), 16) || 0;
+  return WALL_TINTS[n % WALL_TINTS.length];
+}
+
 export default function Home() {
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(false);
@@ -358,7 +381,7 @@ export default function Home() {
       </section>
 
       {/* ── Wall of pastes ────────────────────────────────────────────── */}
-      <section className="mx-auto max-w-5xl w-full px-6 pb-24">
+      <section className="mx-auto max-w-6xl w-full px-6 pb-24">
         <div className="flex items-baseline justify-between mb-6">
           <h2 className="text-2xl font-semibold tracking-tight">
             Recent pastes
@@ -375,26 +398,44 @@ export default function Home() {
             No pastes yet. Yours could be the first one here forever.
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {recent.map((p) => (
-              <Link
-                key={p.id}
-                href={`/p/${p.id}`}
-                className="group rounded-lg border border-border/40 bg-card/30 p-4 hover:bg-card/60 hover:border-border transition"
-              >
-                <p className="font-mono text-sm text-foreground/90 line-clamp-4 min-h-[4.5rem] break-words">
-                  {p.preview || "(empty)"}
-                </p>
-                <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
-                  <span className="font-mono truncate" title={p.id}>
-                    {p.id.slice(0, 10)}…
-                  </span>
-                  <span className="shrink-0 ml-2">
-                    {timeAgo(p.created_at)} · {formatBytes(p.size_bytes)}
-                  </span>
-                </div>
-              </Link>
-            ))}
+          // CSS columns give us a true masonry layout without JS / any lib.
+          // Items flow top-to-bottom in the left column, then fill the next —
+          // `break-inside-avoid` keeps each card whole. Column count scales
+          // up with the viewport; gap stays consistent.
+          <div className="columns-1 sm:columns-2 lg:columns-3 xl:columns-4 gap-4 [column-fill:_balance]">
+            {recent.map((p) => {
+              const tint = tintFor(p.id);
+              return (
+                <Link
+                  key={p.id}
+                  href={`/p/${p.id}`}
+                  className="group mb-4 block rounded-lg border p-4 transition break-inside-avoid hover:brightness-125"
+                  style={{
+                    backgroundColor: tint.bg,
+                    borderColor: tint.border,
+                  }}
+                >
+                  {/* Preview grows up to 8 lines based on how long the actual
+                      paste is — that's what gives the wall its uneven,
+                      alive-looking rhythm. Short pastes stay small, long
+                      pastes tower. */}
+                  <p className="font-mono text-sm text-foreground/90 line-clamp-[8] whitespace-pre-wrap break-words">
+                    {p.preview || "(empty)"}
+                  </p>
+                  <div
+                    className="mt-3 pt-2 flex items-center justify-between text-xs text-muted-foreground border-t"
+                    style={{ borderColor: tint.border }}
+                  >
+                    <span className="font-mono truncate" title={p.id}>
+                      {p.id.slice(0, 10)}…
+                    </span>
+                    <span className="shrink-0 ml-2">
+                      {timeAgo(p.created_at)} · {formatBytes(p.size_bytes)}
+                    </span>
+                  </div>
+                </Link>
+              );
+            })}
           </div>
         )}
       </section>
