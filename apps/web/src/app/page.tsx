@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -8,7 +8,22 @@ import { Textarea } from "@/components/ui/textarea";
 export default function Home() {
   const [content, setContent] = useState("");
   const [loading, setLoading] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
   const router = useRouter();
+
+  // Tick a progress counter while uploading so the user knows we're not frozen.
+  // Autonomi uploads take 2-4 min — silence feels broken, a timer feels honest.
+  useEffect(() => {
+    if (!loading) {
+      setElapsed(0);
+      return;
+    }
+    const start = Date.now();
+    const interval = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - start) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [loading]);
 
   async function handleSave() {
     if (!content.trim()) return;
@@ -19,16 +34,27 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content }),
       });
-      if (!res.ok) throw new Error("Failed to save");
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to save");
+      }
       const data = await res.json();
       if (data.id) router.push(`/p/${data.id}`);
     } catch (err) {
       console.error(err);
-      alert("Something went wrong. Please try again.");
+      const msg =
+        err instanceof Error
+          ? err.message
+          : "Something went wrong. Please try again.";
+      alert(msg);
     } finally {
       setLoading(false);
     }
   }
+
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  const timeStr = `${mins}:${String(secs).padStart(2, "0")}`;
 
   return (
     <main className="min-h-screen flex flex-col bg-background text-foreground">
@@ -87,9 +113,23 @@ export default function Home() {
             disabled={!content.trim() || loading}
             size="lg"
           >
-            {loading ? "Saving..." : "Save Forever"}
+            {loading ? `Storing on Autonomi... ${timeStr}` : "Save Forever"}
           </Button>
         </div>
+        {loading && (
+          <div className="mt-6 rounded-lg border border-border/40 bg-card/50 p-4 text-sm text-muted-foreground">
+            <p className="mb-2">
+              <span className="inline-block size-2 rounded-full bg-orange-400 animate-pulse mr-2" />
+              Paying for permanent storage on Autonomi — this typically takes{" "}
+              <span className="font-medium text-foreground">2 to 4 minutes</span>.
+            </p>
+            <p className="text-xs">
+              Your paste is being split into encrypted chunks, paid for on
+              Arbitrum, and distributed across the network. Please don&apos;t
+              close this tab.
+            </p>
+          </div>
+        )}
       </section>
 
       <footer className="border-t border-border/40">
