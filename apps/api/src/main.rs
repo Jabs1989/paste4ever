@@ -6,8 +6,8 @@
 //! specific business logic (size limits, future rate limiting, etc).
 
 use axum::{
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{ConnectInfo, Path, Query, State},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -16,8 +16,11 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -26,6 +29,10 @@ struct AppState {
     /// Base URL of the local antd daemon, e.g. http://localhost:8082
     antd_url: String,
     http: reqwest::Client,
+    /// Cloudflare Turnstile secret key. When set, every /paste request
+    /// must include a `turnstile_token` that verifies successfully with
+    /// Cloudflare. When empty (local dev), verification is skipped.
+    turnstile_secret: Option<String>,
     /// Local SQLite index of pastes made through this API. The index is just
     /// a cache for the /recent wall — the actual paste bytes live on Autonomi
     /// and remain retrievable by address even if this DB is wiped.
@@ -35,6 +42,159 @@ struct AppState {
     /// the external watchdog can restart antd when its DHT rots, and by the
     /// frontend to warn users before they waste a click.
     consecutive_failures: Arc<AtomicU32>,
+    /// Sliding-window rate limiter keyed by client IP + a global bucket.
+    /// Protects the hot wallet: each paste costs ~$0.50 in ANT, so an
+    /// unthrottled public endpoint is an open drain.
+    rate_limiter: Arc<Mutex<RateLimiter>>,
+}
+
+// ── Rate limiting ─────────────────────────────────────────────────────────
+
+/// Max pastes per IP per hour. Generous for legitimate human use
+/// (5 pastes/hour is way more than any real user needs), tight enough to
+/// make griefing uneconomical: ~5 × $0.50 = $2.50/hour per source IP.
+const PER_IP_LIMIT: usize = 5;
+/// Max pastes from the whole service per hour. Hard global cap so even a
+/// distributed botnet can't drain the wallet faster than this. Pick a
+/// number that matches what you're comfortable losing per hour in the
+/// absolute worst case. $10/hour cap at current ANT price.
+const GLOBAL_LIMIT: usize = 20;
+/// Window length for both buckets. One hour.
+const RL_WINDOW: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// In-memory sliding-window rate limiter. For the MVP single-instance
+/// deploy this is fine; swap for Redis if we ever horizontally scale.
+struct RateLimiter {
+    per_ip: HashMap<String, VecDeque<Instant>>,
+    global: VecDeque<Instant>,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            per_ip: HashMap::new(),
+            global: VecDeque::new(),
+        }
+    }
+
+    /// Check whether this IP can do another paste right now. Returns
+    /// Ok(()) on success (and records the attempt) or Err with a
+    /// human-readable reason.
+    fn try_acquire(&mut self, ip: &str) -> Result<(), RateLimitError> {
+        let now = Instant::now();
+        let cutoff = now - RL_WINDOW;
+
+        // Prune the global window before checking.
+        while self.global.front().map(|t| *t < cutoff).unwrap_or(false) {
+            self.global.pop_front();
+        }
+        if self.global.len() >= GLOBAL_LIMIT {
+            return Err(RateLimitError::Global {
+                retry_after_secs: self
+                    .global
+                    .front()
+                    .map(|t| RL_WINDOW.as_secs().saturating_sub(now.duration_since(*t).as_secs()))
+                    .unwrap_or(RL_WINDOW.as_secs()),
+            });
+        }
+
+        let bucket = self.per_ip.entry(ip.to_string()).or_default();
+        while bucket.front().map(|t| *t < cutoff).unwrap_or(false) {
+            bucket.pop_front();
+        }
+        if bucket.len() >= PER_IP_LIMIT {
+            return Err(RateLimitError::PerIp {
+                retry_after_secs: bucket
+                    .front()
+                    .map(|t| RL_WINDOW.as_secs().saturating_sub(now.duration_since(*t).as_secs()))
+                    .unwrap_or(RL_WINDOW.as_secs()),
+            });
+        }
+
+        bucket.push_back(now);
+        self.global.push_back(now);
+        Ok(())
+    }
+
+    /// Periodically called to stop per_ip from growing unboundedly for
+    /// IPs we haven't seen in a while. Called from the size-limit check
+    /// in create_paste so we don't need a separate background task.
+    fn gc(&mut self) {
+        let cutoff = Instant::now() - RL_WINDOW;
+        self.per_ip.retain(|_, bucket| {
+            while bucket.front().map(|t| *t < cutoff).unwrap_or(false) {
+                bucket.pop_front();
+            }
+            !bucket.is_empty()
+        });
+    }
+}
+
+#[derive(Debug)]
+enum RateLimitError {
+    PerIp { retry_after_secs: u64 },
+    Global { retry_after_secs: u64 },
+}
+
+// ── Turnstile ──────────────────────────────────────────────────────────────
+
+/// Cloudflare's verify response. We only care about the `success` flag;
+/// action/hostname/cdata are available for future tightening.
+#[derive(Deserialize)]
+struct TurnstileVerifyResponse {
+    success: bool,
+    #[serde(rename = "error-codes", default)]
+    error_codes: Vec<String>,
+}
+
+/// Verify a Turnstile token against Cloudflare's siteverify endpoint.
+/// `ip` is optional but recommended — Cloudflare uses it as a tamper check.
+/// Returns Ok(()) on success or Err with a short reason suitable for logs.
+async fn verify_turnstile(
+    http: &reqwest::Client,
+    secret: &str,
+    token: &str,
+    ip: Option<&str>,
+) -> Result<(), String> {
+    // Short timeout — this call is in the hot path of every paste and we'd
+    // rather fail closed than hang if Cloudflare is flaky.
+    let mut form = vec![("secret", secret), ("response", token)];
+    if let Some(ip) = ip {
+        form.push(("remoteip", ip));
+    }
+    let res = http
+        .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
+        .form(&form)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|e| format!("turnstile network error: {}", e))?;
+    let parsed: TurnstileVerifyResponse = res
+        .json()
+        .await
+        .map_err(|e| format!("turnstile parse error: {}", e))?;
+    if parsed.success {
+        Ok(())
+    } else {
+        Err(format!("turnstile failed: {:?}", parsed.error_codes))
+    }
+}
+
+/// Extract the real client IP. Precedence matches what Cloudflare Tunnel
+/// and standard reverse proxies put on the wire:
+///   1. CF-Connecting-IP  (Cloudflare set this; trust it when we're behind CF)
+///   2. X-Forwarded-For   (first hop, which is the original client)
+///   3. The direct TCP peer address (localhost/dev case)
+fn client_ip(headers: &HeaderMap, peer: SocketAddr) -> String {
+    if let Some(v) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
+        return v.trim().to_string();
+    }
+    if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        if let Some(first) = v.split(',').next() {
+            return first.trim().to_string();
+        }
+    }
+    peer.ip().to_string()
 }
 
 // ── SQLite schema ─────────────────────────────────────────────────────────
@@ -77,6 +237,10 @@ fn init_db(path: &str) -> anyhow::Result<Connection> {
 #[derive(Deserialize)]
 struct CreatePasteRequest {
     content: String,
+    /// Cloudflare Turnstile response token. Required in production (when
+    /// the server has TURNSTILE_SECRET_KEY set), ignored in local dev.
+    #[serde(default)]
+    turnstile_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -167,6 +331,8 @@ const UPLOAD_RETRY_DELAYS_SECS: &[u64] = &[15, 45];
 
 async fn create_paste(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(req): Json<CreatePasteRequest>,
 ) -> impl IntoResponse {
     if req.content.is_empty() {
@@ -182,6 +348,66 @@ async fn create_paste(
             Json(serde_json::json!({ "error": "Content too large (max 100KB)" })),
         )
             .into_response();
+    }
+
+    // Rate limit BEFORE any antd contact — we never want a throttled
+    // request to cost us a chunk-payment. Also GC the per_ip map opportunistically
+    // while we hold the lock, to keep memory bounded.
+    let ip = client_ip(&headers, peer);
+    {
+        let mut rl = state.rate_limiter.lock();
+        rl.gc();
+        if let Err(e) = rl.try_acquire(&ip) {
+            let (reason, retry) = match e {
+                RateLimitError::PerIp { retry_after_secs } => (
+                    "You've hit the per-IP paste limit. Try again later.",
+                    retry_after_secs,
+                ),
+                RateLimitError::Global { retry_after_secs } => (
+                    "Paste4Ever is busy right now. Please try again shortly.",
+                    retry_after_secs,
+                ),
+            };
+            tracing::warn!("rate-limited ip={} reason={}", ip, reason);
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [("retry-after", retry.to_string())],
+                Json(serde_json::json!({
+                    "error": reason,
+                    "retry_after_secs": retry,
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Turnstile verification. Only enforced when the server has a secret
+    // configured (production). Local dev leaves TURNSTILE_SECRET_KEY unset
+    // so curl + localhost work without a token.
+    if let Some(secret) = state.turnstile_secret.as_deref() {
+        let token = match req.turnstile_token.as_deref() {
+            Some(t) if !t.is_empty() => t,
+            _ => {
+                tracing::warn!("turnstile: missing token ip={}", ip);
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "Human verification required. Please complete the challenge and try again.",
+                    })),
+                )
+                    .into_response();
+            }
+        };
+        if let Err(e) = verify_turnstile(&state.http, secret, token, Some(&ip)).await {
+            tracing::warn!("turnstile: verification failed ip={} err={}", ip, e);
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "Human verification failed. Please refresh and try again.",
+                })),
+            )
+                .into_response();
+        }
     }
 
     let body = AntdPutRequest {
@@ -514,11 +740,23 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("📒 wall index DB: {}", db_path);
     let db = Arc::new(Mutex::new(init_db(&db_path)?));
 
+    // TURNSTILE_SECRET_KEY: when present, every /paste requires a token that
+    // verifies against Cloudflare. Empty / unset = dev mode (no challenge).
+    let turnstile_secret = std::env::var("TURNSTILE_SECRET_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    match &turnstile_secret {
+        Some(_) => tracing::info!("🛡  Turnstile enabled (human verification required)"),
+        None => tracing::warn!("⚠  Turnstile disabled — /paste is open to any caller"),
+    }
+
     let state = AppState {
         antd_url,
         http,
+        turnstile_secret,
         db,
         consecutive_failures: Arc::new(AtomicU32::new(0)),
+        rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
     };
 
     let cors = CorsLayer::new()
@@ -541,6 +779,14 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     println!("🚀 Paste4Ever API listening on http://localhost:{}", port);
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info` gives handlers access to the TCP
+    // peer address via ConnectInfo<SocketAddr>. The rate limiter uses it as
+    // a fallback IP key when CF-Connecting-IP / X-Forwarded-For are absent
+    // (i.e. in local dev and curl).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

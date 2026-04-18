@@ -1,10 +1,37 @@
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import Script from "next/script";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+
+// Cloudflare Turnstile site key. When unset (local dev) we skip the widget
+// entirely and the Rust API also skips verification — dev works with no
+// Cloudflare account.
+const TURNSTILE_SITE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || "";
+
+// Minimal typing of the global Cloudflare Turnstile API we touch.
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (
+        el: HTMLElement | string,
+        opts: {
+          sitekey: string;
+          callback?: (token: string) => void;
+          "error-callback"?: () => void;
+          "expired-callback"?: () => void;
+          theme?: "auto" | "light" | "dark";
+          appearance?: "always" | "execute" | "interaction-only";
+        }
+      ) => string;
+      reset: (widgetId?: string) => void;
+      remove: (widgetId?: string) => void;
+    };
+  }
+}
 
 // Hot wallet that pays for every paste. Tips go directly into the same wallet,
 // so a donation of ANT literally buys future pastes for other users. ETH also
@@ -47,6 +74,10 @@ export default function Home() {
   const [recent, setRecent] = useState<RecentPaste[]>([]);
   const [copiedAddr, setCopiedAddr] = useState(false);
   const [health, setHealth] = useState<Health | null>(null);
+  const [turnstileToken, setTurnstileToken] = useState<string | null>(null);
+  const [turnstileReady, setTurnstileReady] = useState(false);
+  const turnstileWidgetId = useRef<string | null>(null);
+  const turnstileDivRef = useRef<HTMLDivElement | null>(null);
   const router = useRouter();
 
   const loadHealth = useCallback(async () => {
@@ -87,6 +118,24 @@ export default function Home() {
     return () => clearInterval(t);
   }, [loadHealth]);
 
+  // Render the Turnstile widget once the Cloudflare script has loaded.
+  // We gate on both `turnstileReady` (script loaded) and the ref being
+  // attached so we don't try to render into a null element.
+  useEffect(() => {
+    if (!TURNSTILE_SITE_KEY) return;
+    if (!turnstileReady) return;
+    if (!turnstileDivRef.current) return;
+    if (turnstileWidgetId.current) return; // already rendered
+    if (!window.turnstile) return;
+    turnstileWidgetId.current = window.turnstile.render(turnstileDivRef.current, {
+      sitekey: TURNSTILE_SITE_KEY,
+      theme: "auto",
+      callback: (token: string) => setTurnstileToken(token),
+      "error-callback": () => setTurnstileToken(null),
+      "expired-callback": () => setTurnstileToken(null),
+    });
+  }, [turnstileReady]);
+
   // Tick an elapsed counter while uploading so the user knows we're not frozen.
   useEffect(() => {
     if (!loading) {
@@ -102,12 +151,21 @@ export default function Home() {
 
   async function handleSave() {
     if (!content.trim()) return;
+    // If Turnstile is enabled on the frontend, we must have a token. The
+    // button should already be disabled in that case, but belt-and-braces.
+    if (TURNSTILE_SITE_KEY && !turnstileToken) {
+      alert("Please complete the human verification challenge.");
+      return;
+    }
     setLoading(true);
     try {
       const res = await fetch("/api/paste", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content }),
+        body: JSON.stringify({
+          content,
+          turnstile_token: turnstileToken ?? undefined,
+        }),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -122,6 +180,11 @@ export default function Home() {
           ? err.message
           : "Something went wrong. Please try again.";
       alert(msg);
+      // Tokens are single-use — reset the widget so the user can try again.
+      if (turnstileWidgetId.current && window.turnstile) {
+        window.turnstile.reset(turnstileWidgetId.current);
+        setTurnstileToken(null);
+      }
     } finally {
       setLoading(false);
     }
@@ -140,6 +203,13 @@ export default function Home() {
 
   return (
     <main className="min-h-screen flex flex-col bg-background text-foreground">
+      {TURNSTILE_SITE_KEY && (
+        <Script
+          src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+          strategy="afterInteractive"
+          onLoad={() => setTurnstileReady(true)}
+        />
+      )}
       <header className="border-b border-border/40">
         <div className="mx-auto max-w-5xl px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -215,17 +285,26 @@ export default function Home() {
           className="min-h-[400px] font-mono text-sm resize-none"
           disabled={loading}
         />
-        <div className="mt-4 flex items-center justify-between">
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
           <span className="text-xs text-muted-foreground">
             {content.length.toLocaleString()} characters
           </span>
-          <Button
-            onClick={handleSave}
-            disabled={!content.trim() || loading}
-            size="lg"
-          >
-            {loading ? `Storing on Autonomi... ${timeStr}` : "Save Forever"}
-          </Button>
+          <div className="flex items-center gap-3">
+            {TURNSTILE_SITE_KEY && (
+              <div ref={turnstileDivRef} className="cf-turnstile" />
+            )}
+            <Button
+              onClick={handleSave}
+              disabled={
+                !content.trim() ||
+                loading ||
+                (!!TURNSTILE_SITE_KEY && !turnstileToken)
+              }
+              size="lg"
+            >
+              {loading ? `Storing on Autonomi... ${timeStr}` : "Save Forever"}
+            </Button>
+          </div>
         </div>
         {loading && (
           <div className="mt-6 rounded-lg border border-border/40 bg-card/50 p-4 text-sm text-muted-foreground">
