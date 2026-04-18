@@ -230,6 +230,17 @@ async fn create_paste(
             last_error_detail = Some(format!("{}: {}", status, detail));
             // 5xx = server/network problem → retry. 4xx = client problem → give up.
             if status.is_server_error() {
+                // "partial upload: N stored, M failed" is a specific signal that
+                // some K-bucket in the DHT has stale peers and can't hold a
+                // chunk. That's exactly the condition the watchdog needs to
+                // see to decide on an antd restart — bump the counter *now*
+                // instead of waiting for all retries to exhaust. A subsequent
+                // successful attempt within the same request will reset it
+                // back to 0, so false positives self-heal quickly.
+                if detail.contains("partial upload") || detail.contains("chunk storage failed") {
+                    let n = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                    tracing::warn!("DHT-rot signal detected (consecutive_failures={})", n);
+                }
                 continue;
             }
             return (
@@ -290,9 +301,17 @@ async fn create_paste(
             .into_response();
     }
 
-    // All attempts exhausted — flip the health counter so the watchdog and
-    // the frontend badge both see the degraded state.
-    let new_count = state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+    // All attempts exhausted. The counter has already been bumped by each
+    // partial-upload attempt along the way (see the 5xx path above), so we
+    // don't increment again here — that would double-count on a fully-bad
+    // paste. If no partial-upload was seen (e.g. pure transport failure)
+    // we still bump once so the watchdog notices something is off.
+    let current = state.consecutive_failures.load(Ordering::Relaxed);
+    let new_count = if current == 0 {
+        state.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        current
+    };
     tracing::error!(
         "❌ upload failed after {} attempts — last error: {:?} (consecutive_failures={})",
         UPLOAD_MAX_ATTEMPTS,

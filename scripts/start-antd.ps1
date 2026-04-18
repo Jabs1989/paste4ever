@@ -40,7 +40,12 @@ $env:EVM_PAYMENT_TOKEN_ADDRESS = "0xa78d8321B20c4Ef90eCd72f2588AA985A4BDb684"
 $env:EVM_PAYMENT_VAULT_ADDRESS = "0x9A3EcAc693b699Fc0B2B6A50B5549e50c2320A26"
 
 if (-not $env:RUST_LOG) {
-    $env:RUST_LOG = "info,saorsa_core=warn,saorsa_transport=warn"
+    # Silence the saorsa transport/DHT spam (IPv6 dual-send failures on
+    # Windows, K-bucket-at-capacity warnings, sweep logs) at the error
+    # level so only genuine failures survive. Keep antd's own logs and
+    # the ant_core storage + evmlib payment info visible so we can still
+    # see the interesting lines (paid tx hashes, chunks stored, etc).
+    $env:RUST_LOG = "info,saorsa_core=error,saorsa_transport=error,ant_core=info,antd=info,evmlib=info"
 }
 
 if (-not $env:ANTD_BIN) {

@@ -23,7 +23,12 @@
 param(
     [string]$HealthUrl     = "http://localhost:8080/health",
     [int]   $PollSeconds   = 30,
-    [int]   $FailThreshold = 3,
+    # 2 consecutive degraded polls = 60s of confirmed DHT rot. Lower than
+    # the original 3 because the API now bumps consecutive_failures on
+    # every "partial upload" 500 response (not just after all retries
+    # exhaust), which means /health flips to degraded faster and a single
+    # long-running bad paste is enough signal on its own.
+    [int]   $FailThreshold = 2,
     [int]   $BootSeconds   = 45
 )
 
