@@ -40,12 +40,18 @@ $env:EVM_PAYMENT_TOKEN_ADDRESS = "0xa78d8321B20c4Ef90eCd72f2588AA985A4BDb684"
 $env:EVM_PAYMENT_VAULT_ADDRESS = "0x9A3EcAc693b699Fc0B2B6A50B5549e50c2320A26"
 
 if (-not $env:RUST_LOG) {
-    # Silence the saorsa transport/DHT spam (IPv6 dual-send failures on
-    # Windows, K-bucket-at-capacity warnings, sweep logs) at the error
-    # level so only genuine failures survive. Keep antd's own logs and
-    # the ant_core storage + evmlib payment info visible so we can still
-    # see the interesting lines (paid tx hashes, chunks stored, etc).
-    $env:RUST_LOG = "info,saorsa_core=error,saorsa_transport=error,ant_core=info,antd=info,evmlib=info"
+    # Silence the saorsa transport/DHT spam that dominates the log:
+    #   - saorsa_transport::high_level::connection = OFF
+    #       kills the "os error 10049" IPv6-dual-stack spam on Windows
+    #       (saorsa tries ::ffff:x.x.x.x, Windows rejects, it falls back
+    #       to IPv4 which works — these errors are cosmetic)
+    #   - saorsa_transport = error
+    #       keeps any *other* transport-level errors visible
+    #   - saorsa_core = error
+    #       kills [DUAL SEND] IPv6 warnings + K-bucket-at-capacity
+    # Keep antd, ant_core (chunk storage), and evmlib (payments) at info
+    # so we still see tx hashes and "chunks stored" lines.
+    $env:RUST_LOG = "info,saorsa_core=error,saorsa_transport=error,saorsa_transport::high_level::connection=off,ant_core=info,antd=info,evmlib=info"
 }
 
 if (-not $env:ANTD_BIN) {
