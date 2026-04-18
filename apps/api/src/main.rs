@@ -21,6 +21,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use axum::http::{HeaderName, Method};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
@@ -773,10 +774,32 @@ async fn main() -> anyhow::Result<()> {
         rate_limiter: Arc::new(Mutex::new(RateLimiter::new())),
     };
 
+    // CORS. The frontend lives on paste4ever.com / www.paste4ever.com and
+    // calls this API directly from the browser (bypassing the Worker proxy
+    // to avoid same-zone fetch issues). We need to spell methods/headers
+    // explicitly: axum-cors's `Any` sometimes omits preflight responses
+    // for POST-with-JSON requests, which would break paste creation with
+    // a misleading 'Failed to fetch' in the browser.
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::ACCEPT,
+            // X-Requested-With is sometimes sent by fetch libs as a hint;
+            // easier to just accept it than debug a missing-header rejection.
+            HeaderName::from_static("x-requested-with"),
+        ])
+        .expose_headers([
+            // retry-after is set on 429 responses; browsers strip it by
+            // default unless explicitly exposed.
+            axum::http::header::RETRY_AFTER,
+        ])
+        .max_age(std::time::Duration::from_secs(3600));
 
     let app = Router::new()
         .route("/", get(health))
