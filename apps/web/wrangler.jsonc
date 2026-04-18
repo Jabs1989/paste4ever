@@ -1,0 +1,28 @@
+/**
+ * Paste4Ever web — Cloudflare Workers deploy config.
+ *
+ * The Next.js app is compiled into `.open-next/worker.js` by the
+ * @opennextjs/cloudflare adapter. Static assets live under
+ * `.open-next/assets` and are served by Cloudflare's asset binding.
+ *
+ * Env vars (RUST_API_URL, NEXT_PUBLIC_TURNSTILE_SITE_KEY) come from
+ * the Cloudflare dashboard, NOT from this file — we don't want the
+ * public site key in git where a fork could accidentally inherit it
+ * and we don't ever want the secret key near this file.
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "paste4ever",
+  "main": ".open-next/worker.js",
+  "compatibility_date": "2025-03-01",
+  // nodejs_compat: OpenNext emits some Node.js API usage (Buffer, process,
+  // Stream, etc.) that needs the Workers Node.js compatibility layer.
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": ".open-next/assets",
+    "binding": "ASSETS"
+  },
+  "observability": {
+    "enabled": true
+  }
+}

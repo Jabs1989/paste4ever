@@ -17,6 +17,10 @@
 /.next/
 /out/
 
+# Cloudflare Workers (OpenNext adapter output + local wrangler state)
+/.open-next/
+/.wrangler/
+
 # production
 /build
 
