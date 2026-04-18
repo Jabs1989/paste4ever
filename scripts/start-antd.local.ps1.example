@@ -1,9 +1,15 @@
 # Copy this file to `start-antd.local.ps1` and fill in your own values.
-# The .local copy is gitignored — never commit your wallet key.
+# The .local copy is gitignored -- never commit your wallet key.
 
 # REQUIRED: the private key of the hot wallet that pays for pastes.
 # Must hold ANT (storage) + ETH (Arbitrum gas).
 $env:AUTONOMI_WALLET_KEY = "0xYOUR_PRIVATE_KEY_HERE"
+
+# REQUIRED: comma-separated bootstrap peers for the Autonomi mainnet.
+# Without these, antd comes up with peer_count=0 and every upload fails.
+# Get an up-to-date list from the Autonomi Discord (#mainnet channel) or
+# the antd README. Paste the whole thing as ONE line:
+$env:ANTD_PEERS = "/ip4/PEER1_IP/udp/PORT/quic,/ip4/PEER2_IP/udp/PORT/quic"
 
 # OPTIONAL: override default paths.
 # $env:ANTD_BIN    = "D:\autonomi\antd.exe"

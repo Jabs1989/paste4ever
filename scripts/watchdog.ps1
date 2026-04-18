@@ -1,6 +1,6 @@
-# ──────────────────────────────────────────────────────────────────────────
+# ==========================================================================
 #  watchdog.ps1
-# ──────────────────────────────────────────────────────────────────────────
+# ==========================================================================
 #
 #  Polls the Paste4Ever API's /health endpoint every 30s. If the status
 #  reports `degraded` for N consecutive polls, the watchdog kills the
@@ -16,15 +16,15 @@
 #  Run it in a dedicated PowerShell window:
 #    .\scripts\watchdog.ps1
 #
-#  You'll see antd's own logs in the window this script opens — the
+#  You'll see antd's own logs in the window this script opens -- the
 #  watchdog just writes a status line every poll.
-# ──────────────────────────────────────────────────────────────────────────
+# ==========================================================================
 
 param(
     [string]$HealthUrl     = "http://localhost:8080/health",
     [int]   $PollSeconds   = 30,
-    [int]   $FailThreshold = 3,   # consecutive degraded polls before restart
-    [int]   $BootSeconds   = 45   # wait after spawn before polling resumes
+    [int]   $FailThreshold = 3,
+    [int]   $BootSeconds   = 45
 )
 
 $ErrorActionPreference = "Continue"
@@ -32,20 +32,16 @@ $scriptDir   = $PSScriptRoot
 $startScript = Join-Path $scriptDir "start-antd.ps1"
 
 if (-not (Test-Path $startScript)) {
-    Write-Host "❌ Can't find $startScript" -ForegroundColor Red
+    Write-Host "ERROR: Can't find $startScript" -ForegroundColor Red
     exit 1
 }
 
 function Get-AntdProcess {
-    # antd.exe — match on image name, not window title, because the watchdog
-    # spawns antd in a child window that may have a different title.
     Get-Process -Name "antd" -ErrorAction SilentlyContinue
 }
 
 function Start-Antd {
-    Write-Host "[$(Get-Date -Format HH:mm:ss)] 🚀 Spawning antd via start-antd.ps1..." -ForegroundColor Cyan
-    # Spawn in a new window so antd logs are visible to the operator while
-    # this watchdog window keeps showing the poll status.
+    Write-Host "[$(Get-Date -Format HH:mm:ss)] SPAWN  Spawning antd via start-antd.ps1..." -ForegroundColor Cyan
     Start-Process powershell.exe -ArgumentList @(
         "-NoExit",
         "-ExecutionPolicy", "Bypass",
@@ -60,10 +56,9 @@ function Stop-Antd {
         return
     }
     foreach ($p in $procs) {
-        Write-Host "[$(Get-Date -Format HH:mm:ss)] 🛑 Killing antd PID $($p.Id)" -ForegroundColor Yellow
+        Write-Host "[$(Get-Date -Format HH:mm:ss)] KILL   Killing antd PID $($p.Id)" -ForegroundColor Yellow
         try { Stop-Process -Id $p.Id -Force } catch { Write-Host "   failed: $_" -ForegroundColor Red }
     }
-    # Give the OS a second to release the socket before the next spawn.
     Start-Sleep -Seconds 2
 }
 
@@ -76,15 +71,14 @@ function Get-Health {
     }
 }
 
-Write-Host "👁  Paste4Ever watchdog started" -ForegroundColor Green
+Write-Host "Paste4Ever watchdog started" -ForegroundColor Green
 Write-Host "    url:       $HealthUrl"
-Write-Host "    every:     ${PollSeconds}s"
-Write-Host "    threshold: $FailThreshold consecutive degraded polls → restart antd"
+Write-Host "    every:     $($PollSeconds)s"
+Write-Host "    threshold: $FailThreshold consecutive degraded polls -> restart antd"
 Write-Host ""
 
-# If antd isn't running at all when we start, launch it immediately.
 if (-not (Get-AntdProcess)) {
-    Write-Host "[$(Get-Date -Format HH:mm:ss)] antd is not running — launching now" -ForegroundColor Yellow
+    Write-Host "[$(Get-Date -Format HH:mm:ss)] antd is not running -- launching now" -ForegroundColor Yellow
     Start-Antd
     Start-Sleep -Seconds $BootSeconds
 }
@@ -96,24 +90,22 @@ while ($true) {
     $now = Get-Date -Format HH:mm:ss
 
     if ($null -eq $h) {
-        # /health itself didn't respond — Rust API is probably down. Not our
-        # problem to fix; just log and keep polling.
-        Write-Host "[$now] ⚠  API unreachable (is paste4ever-api.exe running?)" -ForegroundColor DarkYellow
-        $degradedStreak = 0  # can't judge antd if we can't reach the API
+        Write-Host "[$now] WARN   API unreachable (is paste4ever-api.exe running?)" -ForegroundColor DarkYellow
+        $degradedStreak = 0
     }
     elseif ($h.status -eq "healthy") {
-        Write-Host "[$now] 🟢 healthy  (antd_reachable=$($h.antd_reachable), failures=$($h.consecutive_failures))" -ForegroundColor Green
+        Write-Host "[$now] OK     healthy  (antd_reachable=$($h.antd_reachable), failures=$($h.consecutive_failures))" -ForegroundColor Green
         $degradedStreak = 0
     }
     else {
         $degradedStreak++
-        Write-Host "[$now] 🟡 degraded ($degradedStreak/$FailThreshold) antd_reachable=$($h.antd_reachable), failures=$($h.consecutive_failures)" -ForegroundColor Yellow
+        Write-Host "[$now] DEGR   degraded ($degradedStreak/$FailThreshold) antd_reachable=$($h.antd_reachable), failures=$($h.consecutive_failures)" -ForegroundColor Yellow
 
         if ($degradedStreak -ge $FailThreshold) {
-            Write-Host "[$now] 🚨 threshold hit — restarting antd" -ForegroundColor Red
+            Write-Host "[$now] ALARM  threshold hit -- restarting antd" -ForegroundColor Red
             Stop-Antd
             Start-Antd
-            Write-Host "[$now] ⏳ waiting ${BootSeconds}s for antd to bootstrap before resuming polls"
+            Write-Host "[$now] WAIT   waiting $($BootSeconds)s for antd to bootstrap before resuming polls"
             Start-Sleep -Seconds $BootSeconds
             $degradedStreak = 0
         }
