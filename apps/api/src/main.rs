@@ -342,6 +342,20 @@ async fn create_paste(
         )
             .into_response();
     }
+    // Min-length gate. Autonomi bills per chunk, not per char, so a 1-char
+    // paste costs the same as a 2KB one (~$0.10 in ANT). 20 chars is a
+    // soft floor that filters "a" / "test" / "asdf" spam without hurting
+    // real users — a single tweet is ~200 chars. Counted in chars, not
+    // bytes, so emoji and CJK users don't get penalized.
+    if req.content.chars().count() < 20 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Paste is too short. Please share something worth keeping forever (minimum 20 characters)."
+            })),
+        )
+            .into_response();
+    }
     if req.content.len() > 100_000 {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,

@@ -13,6 +13,11 @@ import { apiUrl } from "@/lib/api";
 // Cloudflare account.
 const TURNSTILE_SITE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY || "";
 
+// Must match the server-side minimum in apps/api/src/main.rs. Autonomi bills
+// per chunk, not per character, so a 1-char paste costs the same as a 2KB
+// one — this floor is about quality, not cost.
+const MIN_CONTENT_LEN = 20;
+
 // Minimal typing of the global Cloudflare Turnstile API we touch.
 declare global {
   interface Window {
@@ -174,7 +179,10 @@ export default function Home() {
   }, [loading]);
 
   async function handleSave() {
-    if (!content.trim()) return;
+    if (Array.from(content.trim()).length < MIN_CONTENT_LEN) {
+      alert(`Pastes must be at least ${MIN_CONTENT_LEN} characters.`);
+      return;
+    }
     // If Turnstile is enabled on the frontend, we must have a token. The
     // button should already be disabled in that case, but belt-and-braces.
     if (TURNSTILE_SITE_KEY && !turnstileToken) {
@@ -310,9 +318,27 @@ export default function Home() {
           disabled={loading}
         />
         <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
-          <span className="text-xs text-muted-foreground">
-            {content.length.toLocaleString()} characters
-          </span>
+          {/* Live char counter. While under the minimum we show a helpful
+              "X / 20 minimum" so users know why the button is disabled.
+              Once they clear the floor it drops to a plain count.
+              Using Array.from(str) to count grapheme code points so emoji
+              aren't double-counted against UTF-16 surrogate pairs. */}
+          {(() => {
+            const count = Array.from(content).length;
+            const tooShort = count > 0 && count < MIN_CONTENT_LEN;
+            return (
+              <span
+                className={`text-xs ${
+                  tooShort ? "text-amber-400" : "text-muted-foreground"
+                }`}
+              >
+                {count.toLocaleString()}
+                {tooShort
+                  ? ` / ${MIN_CONTENT_LEN} minimum`
+                  : " characters"}
+              </span>
+            );
+          })()}
           <div className="flex items-center gap-3">
             {TURNSTILE_SITE_KEY && (
               <div ref={turnstileDivRef} className="cf-turnstile" />
@@ -320,7 +346,7 @@ export default function Home() {
             <Button
               onClick={handleSave}
               disabled={
-                !content.trim() ||
+                Array.from(content.trim()).length < MIN_CONTENT_LEN ||
                 loading ||
                 (!!TURNSTILE_SITE_KEY && !turnstileToken)
               }
