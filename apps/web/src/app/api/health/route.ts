@@ -1,33 +1,35 @@
 import { NextResponse } from "next/server";
-import { Agent, fetch as undiciFetch } from "undici";
 
 const RUST_API_URL = process.env.RUST_API_URL || "http://localhost:8080";
 
-export const runtime = "nodejs";
-// /health is a 3s antd probe at worst. Short timeout keeps a dead backend
-// from blocking the homepage poll.
-export const maxDuration = 15;
+// Runs on the Cloudflare Workers runtime (via OpenNext) in production and on
+// Node locally. We use native fetch — undici's custom Agent doesn't work on
+// the Workers runtime, and the Rust API's /health is fast enough that we
+// don't need a custom dispatcher anyway.
 export const dynamic = "force-dynamic";
-
-const agent = new Agent({
-  headersTimeout: 5_000,
-  bodyTimeout: 5_000,
-  connectTimeout: 3_000,
-});
 
 export async function GET() {
   try {
-    const res = await undiciFetch(`${RUST_API_URL}/health`, { dispatcher: agent });
+    const res = await fetch(`${RUST_API_URL}/health`, {
+      signal: AbortSignal.timeout(5_000),
+      // Opt out of any incidental caching between us and the origin.
+      cache: "no-store",
+    });
     const data = await res.json();
-    // No cache — the point of this endpoint is a fresh read of state.
     return NextResponse.json(data, {
       status: res.status,
       headers: { "Cache-Control": "no-store" },
     });
   } catch {
-    // Rust API itself is down — that's also a degraded state from the user's POV.
+    // API itself unreachable — surface that as a degraded state so the
+    // homepage badge still has something to render against.
     return NextResponse.json(
-      { status: "degraded", antd_reachable: false, consecutive_failures: 0, api_reachable: false },
+      {
+        status: "degraded",
+        antd_reachable: false,
+        consecutive_failures: 0,
+        api_reachable: false,
+      },
       { status: 200, headers: { "Cache-Control": "no-store" } },
     );
   }
